@@ -329,11 +329,25 @@ MemObject* BuildMemoryController(Config& config, uint32_t lineSize, uint32_t fre
 
     //Latency
     uint32_t latency = (type == "DDR")? -1 : config.get<uint32_t>("sys.mem.latency", 100);
-
+    
     MemObject* mem = nullptr;
     if (type == "Simple") {
         mem = new SimpleMemory(latency, name);
-    } else if (type == "MD1") {
+    } else if (type == "Traces") {
+        // Traces' file name
+        bool pim_traces = config.get<bool>("sys.mem.pim_traces", true);
+        if(!pim_traces){ // host_traces
+          g_string tracesFile = config.get<const char*>("sys.mem.outFile", "traces.out");
+          //bool offload_traces = config.get<bool>("sys.mem.offload_traces", true);
+          //bool regular_traces = config.get<bool>("sys.mem.regular_traces", false);
+          bool instr_traces = config.get<bool>("sys.mem.instr_traces", false); // Ignore this for HOST traces
+          bool only_offload = config.get<bool>("sys.mem.only_offload", true);
+          //uint64_t max_offload_instrs = config.get<uint64_t>("sys.mem.max_offload_instrs", 1000);
+          mem = new MemoryTraces(latency, name, only_offload, tracesFile); // LOIS
+        } else {
+          mem = new SimpleMemory(latency, name);
+        }
+    }else if (type == "MD1") {
         // The following params are for MD1 only
         // NOTE: Frequency (in MHz) -- note this is a sys parameter (not sys.mem). There is an implicit assumption of having
         // a single CCT across the system, and we are dealing with latencies in *core* clock cycles
@@ -376,8 +390,10 @@ CacheGroup* BuildCacheGroup(Config& config, const string& name, bool isTerminal)
     CacheGroup& cg = *cgp;
 
     string prefix = "sys.caches." + name + ".";
-
+    std::cout << "prefix: " << prefix << std::endl;
     bool isPrefetcher = config.get<bool>(prefix + "isPrefetcher", false);
+    string prefetch_type = config.get<const char*>(prefix + "ptype", "Stream");
+    printf("****Prefetcher %s\n", prefetch_type.c_str());
     if (isPrefetcher) { //build a prefetcher group
         uint32_t prefetchers = config.get<uint32_t>(prefix + "prefetchers", 1);
         cg.resize(prefetchers);
@@ -386,7 +402,9 @@ CacheGroup* BuildCacheGroup(Config& config, const string& name, bool isTerminal)
             stringstream ss;
             ss << name << "-" << i;
             g_string pfName(ss.str().c_str());
-            cg[i][0] = new StreamPrefetcher(pfName);
+            if(prefetch_type == "Stream") cg[i][0] = new StreamPrefetcher(pfName);
+            else if(prefetch_type == "AMPM") cg[i][0] = new AMPMPrefetcher(pfName);
+            else panic("Prefetcher not implemented: %s", prefetch_type.c_str());
         }
         return cgp;
     }
@@ -633,6 +651,7 @@ static void InitSystem(Config& config) {
                 OOOCore* oooCores;
                 NullCore* nullCores;
             };
+
             if (type == "Simple") {
                 simpleCores = gm_memalign<SimpleCore>(CACHE_LINE_BYTES, cores);
             } else if (type == "Timing") {
@@ -690,14 +709,29 @@ static void InitSystem(Config& config) {
                         zinfo->eventRecorders[coreIdx]->setSourceId(coreIdx);
                         core = tcore;
                     } else {
-                        assert(type == "OOO");
-                        OOOCore* ocore = new (&oooCores[j]) OOOCore(ic, dc, name);
+                      assert(type == "OOO");
+
+                      bool pim_traces = config.get<bool>("sys.mem.pim_traces", true);
+                      bool only_offload = config.get<bool>("sys.mem.only_offload", true);
+                      //bool merge_hostTraces = config.get<bool>("sys.mem.merge_hostTraces", false);
+                      bool merge_hostTraces =  false;
+                      if(pim_traces){
+                        g_string tracesFile = config.get<const char*>("sys.mem.outFile", "traces.out");
+                        bool instr_traces = config.get<bool>("sys.mem.instr_traces", false);
+                        //uint64_t max_offload_instrs = config.get<uint64_t>("sys.mem.max_offload_instrs", 1000);
+                        OOOCore* ocore = new (&oooCores[j]) OOOCore(ic, dc, name, only_offload, instr_traces, tracesFile, merge_hostTraces);
                         zinfo->eventRecorders[coreIdx] = ocore->getEventRecorder();
                         zinfo->eventRecorders[coreIdx]->setSourceId(coreIdx);
                         core = ocore;
+                      } else {
+                        OOOCore* ocore = new (&oooCores[j]) OOOCore(ic, dc, name, only_offload);
+                        zinfo->eventRecorders[coreIdx] = ocore->getEventRecorder();
+                        zinfo->eventRecorders[coreIdx]->setSourceId(coreIdx);
+                        core = ocore;
+                      }
+                      coreMap[group].push_back(core);
+                      coreIdx++;
                     }
-                    coreMap[group].push_back(core);
-                    coreIdx++;
                 }
             } else {
                 assert(type == "Null");
@@ -791,10 +825,12 @@ static void PostInitStats(bool perProcessDir, Config& config) {
     pathStr += "/";
 
     // Absolute paths for stats files. Note these must be in the global heap.
-    const char* pStatsFile = gm_strdup((pathStr + "zsim.h5").c_str());
-    const char* evStatsFile = gm_strdup((pathStr + "zsim-ev.h5").c_str());
-    const char* cmpStatsFile = gm_strdup((pathStr + "zsim-cmp.h5").c_str());
-    const char* statsFile = gm_strdup((pathStr + "zsim.out").c_str());
+    string stats = config.get<const char*>("sys.mem.outFile", "traces.out");
+
+    const char* pStatsFile = gm_strdup((stats + ".zsim.h5").c_str());
+    const char* evStatsFile = gm_strdup((stats + ".zsim-ev.h5").c_str());
+    const char* cmpStatsFile = gm_strdup((stats + ".zsim-cmp.h5").c_str());
+    const char* statsFile = gm_strdup((stats + ".zsim.out").c_str());
 
     if (zinfo->statsPhaseInterval) {
         const char* periodicStatsFilter = config.get<const char*>("sim.periodicStatsFilter", "");
@@ -917,6 +953,7 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
     zinfo->maxPhases = config.get<uint64_t>("sim.maxPhases", 0);
     zinfo->maxMinInstrs = config.get<uint64_t>("sim.maxMinInstrs", 0);
     zinfo->maxTotalInstrs = config.get<uint64_t>("sim.maxTotalInstrs", 0);
+    zinfo->maxOffloadInstrs = config.get<uint64_t>("sim.max_offload_instrs", 0);
 
     uint64_t maxSimTime = config.get<uint32_t>("sim.maxSimTime", 0);
     zinfo->maxSimTimeNs = maxSimTime*1000L*1000L*1000L;
@@ -1024,4 +1061,3 @@ void SimInit(const char* configFile, const char* outputDir, uint32_t shmid) {
     //Causes every other process to wake up
     gm_set_glob_ptr(zinfo);
 }
-
